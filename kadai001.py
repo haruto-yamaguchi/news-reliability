@@ -117,3 +117,5 @@ cm = confusion_matrix(
 disp = ConfusionMatrixDisplay(confusion_matrix=cm)
 
 disp.plot()
+
+plot.show()
