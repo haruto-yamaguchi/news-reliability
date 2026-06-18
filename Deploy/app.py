@@ -5,10 +5,10 @@ import numpy as np
 from scipy.sparse import hstack
 
 # モデルの読み込み
-model = joblib.load("/Deploy/models/kadai003_model.pkl")
-vectorizer = joblib.load("/Deploy/models/kadai003_vectorizer.pkl")
-scaler = joblib.load("/Deploy/models/kadai003_scaler.pkl")
-real_stats = joblib.load("/Deploy/models/kadai003_real_stats.pkl")
+model = joblib.load("models/kadai003_model.pkl")
+vectorizer = joblib.load("models/kadai003_vectorizer.pkl")
+scaler = joblib.load("models/kadai003_scaler.pkl")
+real_stats = joblib.load("models/kadai003_real_stats.pkl")
 
 tagger = fugashi.Tagger()
 
