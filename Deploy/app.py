@@ -1,3 +1,4 @@
+import os
 import joblib
 import fugashi
 import re
@@ -5,11 +6,12 @@ import numpy as np
 from scipy.sparse import hstack
 import streamlit as st
 
-# モデルの読み込み
-model = joblib.load("Deploy/models/kadai003_model.pkl")
-vectorizer = joblib.load("Deploy/models/kadai003_vectorizer.pkl")
-scaler = joblib.load("Deploy/models/kadai003_scaler.pkl")
-real_stats = joblib.load("Deploy/models/kadai003_real_stats.pkl")
+# モデルの読み込み（app.pyがある場所を基準にする）
+BASE = os.path.dirname(__file__)
+model = joblib.load(os.path.join(BASE, "models/kadai003_model.pkl"))
+vectorizer = joblib.load(os.path.join(BASE, "models/kadai003_vectorizer.pkl"))
+scaler = joblib.load(os.path.join(BASE, "models/kadai003_scaler.pkl"))
+real_stats = joblib.load(os.path.join(BASE, "models/kadai003_real_stats.pkl"))
 
 tagger = fugashi.Tagger()
 
@@ -61,47 +63,43 @@ def extract_features(text):
     return [exclamation, ambiguity, symbol, length, digit_r, proper_r,
             avg_sent_len, noun_r, sent_count, kanji_r, hira_r, sentiment, digit_c, kata_c]
 
-# 各特徴量のわかりやすい名前
-FEATURE_LABELS = [
-    "感嘆符（！）",
-    "曖昧な表現",
-    "記号",
-    "文章の長さ",
-    "数字の割合",
-    "固有名詞の割合",
-    "一文の長さ",
-    "名詞の割合",
-    "文の数",
-    "漢字の割合",
-    "ひらがなの割合",
-    "感情の偏り",
-    "数字の数",
-    "カタカナの数",
+# 各特徴量の言い回し（多いとき, 少ないとき）。extract_featuresの並び順と対応
+FEATURE_PHRASES = [
+    ("感嘆符（！）が多い", "感嘆符（！）が少ない"),
+    ("曖昧な表現が多い", "曖昧な表現が少ない"),
+    ("記号が多い", "記号が少ない"),
+    ("文章が長い", "文章が短い"),
+    ("数字の割合が高い", "数字の割合が低い"),
+    ("固有名詞が多い", "固有名詞が少ない"),
+    ("一文が長い", "一文が短い"),
+    ("名詞が多い", "名詞が少ない"),
+    ("文の数が多い", "文の数が少ない"),
+    ("漢字が多い", "漢字が少ない"),
+    ("ひらがなが多い", "ひらがなが少ない"),
+    ("肯定的な表現が多い", "否定的な表現が多い"),
+    ("数字が多い", "数字が少ない"),
+    ("カタカナが多い", "カタカナが少ない"),
 ]
 
 def make_reasons(features):
-    """リアル記事とフェイク記事の平均、どちら寄りかで理由を生成"""
+    """記事の各特徴量が平均より多い/少ないかで理由を生成"""
     real_mean = real_stats["real_mean"]
     fake_mean = real_stats["fake_mean"]
     values = features[0]
 
     reasons = []
-    for label, val, r_m, f_m in zip(FEATURE_LABELS, values, real_mean, fake_mean):
+    for (high_phrase, low_phrase), val, r_m, f_m in zip(FEATURE_PHRASES, values, real_mean, fake_mean):
+        # リアルとフェイクの中間を「平均的」の基準にする
+        mid = (r_m + f_m) / 2
         gap = f_m - r_m
-        # リアルとフェイクの平均がほぼ同じ特徴量は判断材料にならないので除外
         if abs(gap) < 1e-9:
-            continue
-        # この記事の値が、リアル(0.0)〜フェイク(1.0)のどの位置にあるか
-        pos = (val - r_m) / gap
-        # 0.5を境にどちら寄りかを判定。0.5から離れているほど強い根拠
-        strength = abs(pos - 0.5)
+            continue  # リアルとフェイクで差がない特徴量は判断材料にしない
+        # 基準からどれだけ離れているか（リアル〜フェイクの差を1とした大きさ）
+        strength = abs(val - mid) / abs(gap)
         if strength < 0.25:
-            continue  # 中間付近は理由にしない
-        if pos > 0.5:
-            side = "フェイク記事に近い"
-        else:
-            side = "リアル記事に近い"
-        reasons.append((strength, f"{label}が{side}"))
+            continue  # 平均的な範囲は理由にしない
+        phrase = high_phrase if val > mid else low_phrase
+        reasons.append((strength, phrase))
 
     # 根拠の強い順に並べる
     reasons.sort(reverse=True)
@@ -130,10 +128,22 @@ def predict_reliability(text):
     return reliability, reasons
 
 st.title("ニュース信頼度判定")
-text = st.text_area("ニュース本文を入力してください")
+text = st.text_area("ニュース本文を貼り付けてください")
 
 if st.button("判定する"):
-    score, reasons = predict_reliability(text)
-    st.write(f"信頼度: {score}%")
-    for r in reasons:
-        st.write("・", r)
+    if not text.strip():
+        st.warning("テキストを入力してください")
+    else:
+        score, reasons = predict_reliability(text)
+        st.metric("信頼度", f"{score}%")
+        if score >= 70:
+            st.success("信頼できる可能性が高い")
+        elif score >= 40:
+            st.warning("判断が難しい")
+        else:
+            st.error("フェイクの可能性が高い")
+
+        if reasons:
+            st.write("**この記事の特徴:**")
+            for r in reasons:
+                st.write("・", r)
