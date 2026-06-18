@@ -130,7 +130,7 @@ def predict_reliability(text):
     return reliability, reasons
 
 st.title("ニュース信頼度判定")
-text = st.text_area("ニュース本文を貼り付けてください")
+text = st.text_area("ニュース本文を入力してください")
 
 if st.button("判定する"):
     score, reasons = predict_reliability(text)
