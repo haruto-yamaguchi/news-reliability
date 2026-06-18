@@ -3,6 +3,7 @@ import fugashi
 import re
 import numpy as np
 from scipy.sparse import hstack
+import streamlit as st
 
 # モデルの読み込み
 model = joblib.load("Deploy/models/kadai003_model.pkl")
@@ -127,10 +128,6 @@ def predict_reliability(text):
 
     reasons = make_reasons(features)
     return reliability, reasons
-
-if __name__ == "__main__":
-
-import streamkit as st
 
 st.title("ニュース信頼度判定")
 text = st.text_area("ニュース本文を貼り付けてください")
