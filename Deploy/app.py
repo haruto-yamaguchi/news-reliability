@@ -129,31 +129,6 @@ def predict_reliability(text):
     return reliability, reasons
 
 if __name__ == "__main__":
-    import tkinter as tk
-
-    def on_judge():
-        text = text_box.get("1.0", tk.END).strip()
-        if not text:
-            result_label.config(text="テキストを入力してください", fg="gray")
-            reason_label.config(text="")
-            return
-        score, reasons = predict_reliability(text)
-        if score >= 70:
-            judgment = "信頼できる可能性が高い"
-            color = "green"
-        elif score >= 40:
-            judgment = "判断が難しい"
-            color = "orange"
-        else:
-            judgment = "フェイクの可能性が高い"
-            color = "red"
-        result_label.config(text=f"信頼度: {score}%　{judgment}", fg=color)
-
-        if reasons:
-            reason_text = "この記事の特徴:\n" + "\n".join(f"・{r}" for r in reasons)
-        else:
-            reason_text = "この記事の特徴: 平均的な文章です"
-        reason_label.config(text=reason_text)
 
 import streamkit as st
 
