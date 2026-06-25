@@ -143,42 +143,49 @@ def extract_features(text):
 # ──────────────────────────────────────────
 # 判定理由の言い回し（多いとき, 少ないとき）
 # ──────────────────────────────────────────
+# 各特徴量の説明文（多いとき, 少ないとき）
 FEATURE_PHRASES = {
-    "symbol_count":        ("記号が多い", "記号が少ない"),
-    "text_length":         ("文章が長い", "文章が短い"),
-    "digit_ratio":         ("数字の割合が高い", "数字の割合が低い"),
-    "avg_sentence_length": ("一文が長い", "一文が短い"),
-    "sentence_count":      ("文の数が多い", "文の数が少ない"),
-    "kanji_ratio":         ("漢字が多い", "漢字が少ない"),
-    "hiragana_ratio":      ("ひらがなが多い", "ひらがなが少ない"),
-    "report_style_count":  ("報道的な表現が多い", "報道的な表現が少ない"),
-    "quote_style_count":   ("引用・伝聞の表現が多い", "引用・伝聞の表現が少ない"),
-    "person_info_count":   ("人物の情報が多い", "人物の情報が少ない"),
-    "comma_count":         ("読点（、）が多い", "読点（、）が少ない"),
-    "numeric_specificity": ("具体的な数値が多い", "具体的な数値が少ない"),
-    "comma_per_sentence":  ("一文あたりの読点が多い", "一文あたりの読点が少ない"),
-    "proper_noun_ratio":   ("固有名詞が多い", "固有名詞が少ない"),
-    "noun_ratio":          ("名詞が多い", "名詞が少ない"),
-    "lexical_diversity":   ("語彙が多様", "語彙が単調"),
+    "symbol_count":        ("記号が多めに使われています", "記号がほとんど使われていません"),
+    "text_length":         ("文章が長めです", "文章が短めです"),
+    "digit_ratio":         ("文章に占める数字の割合が高めです", "文章に占める数字の割合が低めです"),
+    "avg_sentence_length": ("一文が長めです", "一文が短めです"),
+    "sentence_count":      ("文の数が多めです", "文の数が少なめです"),
+    "kanji_ratio":         ("漢字が多めに使われています", "漢字が少なめです"),
+    "hiragana_ratio":      ("ひらがなが多めです", "ひらがなが少なめです"),
+    "report_style_count":  ("「発表」「実施」などの報道的な表現が多く使われています", "報道的な表現はあまり使われていません"),
+    "quote_style_count":   ("「〜によると」などソースを示す表現が多く使われています", "ソースを示す表現はあまり使われていません"),
+    "person_info_count":   ("「〜氏」「〜さん」など人物に関する情報が多く含まれています", "人物に関する情報は少なめです"),
+    "comma_count":         ("読点（、）が多めです", "読点（、）が少なめです"),
+    "numeric_specificity": ("桁数の大きい具体的な数値が使われています", "具体的な数値は少なめです"),
+    "comma_per_sentence":  ("一文あたりの読点が多めです", "一文あたりの読点が少なめです"),
+    "proper_noun_ratio":   ("固有名詞（地名・組織名など）が多く含まれています", "固有名詞は少なめです"),
+    "noun_ratio":          ("名詞の割合が高めです", "名詞の割合が低めです"),
+    "lexical_diversity":   ("使われている語彙が多様です", "似た言葉が繰り返し使われています"),
 }
 
 def make_reasons(feature_values):
-    """各特徴量が平均より多い/少ないかで理由を生成"""
+    """各特徴量を、信頼度を上げる特徴／下げる特徴に分けて返す"""
     real_mean = feature_stats["real_mean"]
     fake_mean = feature_stats["fake_mean"]
-    reasons = []
+    up, down = [], []   # (強さ, 説明文)
     for col, val, r_m, f_m in zip(FEATURE_COLUMNS, feature_values, real_mean, fake_mean):
         mid = (r_m + f_m) / 2
-        gap = f_m - r_m
+        gap = f_m - r_m   # 正ならフェイク記事で多い特徴
         if abs(gap) < 1e-9:
             continue
         strength = abs(val - mid) / abs(gap)
         if strength < 0.25:
             continue
         high_phrase, low_phrase = FEATURE_PHRASES[col]
-        reasons.append((strength, high_phrase if val > mid else low_phrase))
-    reasons.sort(reverse=True)
-    return [r[1] for r in reasons]
+        phrase = high_phrase if val > mid else low_phrase
+        # この値がフェイク記事側に寄っていれば信頼度を下げる、リアル側なら上げる
+        if (val - mid) * gap > 0:
+            down.append((strength, phrase))
+        else:
+            up.append((strength, phrase))
+    up.sort(reverse=True)
+    down.sort(reverse=True)
+    return [p for _, p in up], [p for _, p in down]
 
 # ──────────────────────────────────────────
 # TextCNN モデル定義（学習時と同じ構造）
@@ -241,29 +248,31 @@ def predict_reliability(text):
 
     real_prob = prob[0]                      # クラス0 = Real
     reliability = round(real_prob * 100, 1)  # 信頼度 = リアルである確率
-    reasons = make_reasons(feats)
-    return reliability, reasons
+    up, down = make_reasons(feats)
+    return reliability, up, down
 
 # ──────────────────────────────────────────
 # 画面
 # ──────────────────────────────────────────
-st.title("ニュース信頼度判定")
+st.title("ニュース信頼度の目安")
+st.caption("文章の書き方の特徴をもとに、信頼度の目安を数値で表示します。"
+           "内容が事実かどうかを判定するものではありません。")
 text = st.text_area("ニュース本文を貼り付けてください", height=250)
 
 if st.button("判定する"):
     if not text.strip():
         st.warning("テキストを入力してください")
     else:
-        score, reasons = predict_reliability(text)
-        st.metric("信頼度", f"{score}%")
-        if score >= 70:
-            st.success("信頼できる可能性が高い")
-        elif score >= 40:
-            st.warning("判断が難しい")
-        else:
-            st.error("フェイクの可能性が高い")
+        score, up, down = predict_reliability(text)
+        st.metric("信頼度の目安", f"{score}%")
 
-        if reasons:
-            st.write("**この記事の特徴:**")
-            for r in reasons:
+        if up:
+            st.write("**信頼度を上げている特徴:**")
+            for r in up:
                 st.write("・", r)
+        if down:
+            st.write("**信頼度を下げている特徴:**")
+            for r in down:
+                st.write("・", r)
+        if not up and not down:
+            st.write("特筆すべき特徴は見られませんでした。")
