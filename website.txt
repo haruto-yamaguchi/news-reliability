@@ -1,1 +1,2 @@
 https://news-reliability.streamlit.app
+https://news-reliability-svm.streamlit.app
