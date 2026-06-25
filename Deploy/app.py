@@ -1,134 +1,254 @@
+# -*- coding: utf-8 -*-
+"""フェイクニュース信頼度判定アプリ（TextCNN版）"""
+
 import os
+import re
+
+import numpy as np
 import joblib
 import fugashi
-import re
-import numpy as np
-from scipy.sparse import hstack
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import streamlit as st
 
-# モデルの読み込み（app.pyがある場所を基準にする）
+# ──────────────────────────────────────────
+# 保存済みファイルの読み込み（app.pyがある場所を基準にする）
+# ──────────────────────────────────────────
 BASE = os.path.dirname(__file__)
-model = joblib.load(os.path.join(BASE, "models/kadai003_model.pkl"))
-vectorizer = joblib.load(os.path.join(BASE, "models/kadai003_vectorizer.pkl"))
-scaler = joblib.load(os.path.join(BASE, "models/kadai003_scaler.pkl"))
-real_stats = joblib.load(os.path.join(BASE, "models/kadai003_real_stats.pkl"))
+ART = os.path.join(BASE, "cnn_artifacts")
+
+config        = joblib.load(os.path.join(ART, "config.pkl"))
+vocab         = joblib.load(os.path.join(ART, "vocab.pkl"))
+scaler        = joblib.load(os.path.join(ART, "scaler.pkl"))
+feature_stats = joblib.load(os.path.join(ART, "feature_stats.pkl"))
+
+FEATURE_COLUMNS = config["feature_columns"]
+MAX_LEN         = config["max_len"]
 
 tagger = fugashi.Tagger()
 
-POSITIVE_WORDS = [
-    "良い", "素晴らしい", "正確", "安全", "信頼", "確認", "事実", "公式",
-    "成功", "改善", "発展", "解決", "安心", "正式", "明確", "適切"
-]
-NEGATIVE_WORDS = [
-    "悪い", "危険", "嘘", "偽", "疑惑", "問題", "失敗", "不正",
-    "批判", "衝撃", "炎上", "拡散", "デマ", "煽り", "怪しい", "不明"
-]
+# ──────────────────────────────────────────
+# トークナイザ（学習時と同じ）
+# ──────────────────────────────────────────
+STOP_WORDS = {"こと", "よう", "ため", "それ", "これ", "もの", "なっ", "れる", "られ"}
 
-def tokenize_text(text):
+def mecab_tokenizer(text):
     tokens = []
-    for word in tagger(text):
+    for word in tagger(str(text)):
         pos = word.feature[0]
-        surface = word.surface
-        if (
-            pos in ["名詞", "動詞", "形容詞"]
-            and len(surface) > 1
-            and not re.fullmatch(r'[0-9０-９]+', surface)
-            and not re.fullmatch(r'[^\w぀-ヿ一-鿿]+', surface)
-        ):
-            tokens.append(surface)
-    return " ".join(tokens)
+        if pos in ["名詞", "動詞", "形容詞"] and word.surface not in STOP_WORDS:
+            tokens.append(word.surface)
+    return tokens
+
+def encode(text):
+    tokens = mecab_tokenizer(text)
+    ids = [vocab.get(token, 1) for token in tokens]
+    ids = ids[:MAX_LEN]
+    ids += [0] * (MAX_LEN - len(ids))
+    return ids
+
+# ──────────────────────────────────────────
+# 独自特徴量（学習時と同じ定義）
+# ──────────────────────────────────────────
+def symbol_count(text):
+    return len(re.findall(r'[^\w぀-ヿ一-鿿\s]', text))
+
+def text_length(text):
+    return len(text)
+
+def digit_ratio(text):
+    return sum(c.isdigit() for c in text) / max(len(text), 1)
+
+def avg_sentence_length(text):
+    sentences = [s for s in re.split(r'[。！？]', text) if s]
+    return sum(len(s) for s in sentences) / len(sentences) if sentences else 0
+
+def sentence_count(text):
+    return len([s for s in re.split(r'[。！？]', text) if s])
+
+def kanji_ratio(text):
+    return len(re.findall(r'[一-龯]', text)) / max(len(text), 1)
+
+def hiragana_ratio(text):
+    return len(re.findall(r'[ぁ-ん]', text)) / max(len(text), 1)
+
+def report_style_count(text):
+    words = ["発表", "協議", "協力", "現地", "今年", "昨年", "今後", "今回",
+             "行った", "開か", "実施", "確認", "報道"]
+    return sum(text.count(w) for w in words)
+
+def quote_style_count(text):
+    words = ["によると", "と語った", "と述べた", "と発表した", "明らかにした",
+             "関係者は", "としている", "とのこと", "という"]
+    return sum(text.count(w) for w in words)
+
+def person_info_count(text):
+    words = ["さん", "氏", "出身", "卒業", "語った", "述べた", "説明した"]
+    return sum(text.count(w) for w in words)
+
+def comma_count(text):
+    return text.count("、")
+
+def numeric_specificity(text):
+    numbers = re.findall(r'\d+', text)
+    if not numbers:
+        return 0
+    return np.mean([len(n) for n in numbers])
+
+def comma_per_sentence(text):
+    sentences = [s for s in re.split(r'[。！？]', text) if s]
+    if not sentences:
+        return 0
+    return text.count("、") / len(sentences)
+
+def mecab_features(text):
+    """proper_noun_ratio / noun_ratio / lexical_diversity をまとめて計算"""
+    words = list(tagger(str(text)))
+    total = len(words)
+    if total == 0:
+        return {"proper_noun_ratio": 0.0, "noun_ratio": 0.0, "lexical_diversity": 0.0}
+    surfaces = [w.surface for w in words]
+    proper = sum(
+        1 for w in words
+        if len(w.feature) > 1 and w.feature[0] == "名詞" and w.feature[1] == "固有名詞"
+    )
+    noun = sum(1 for w in words if w.feature[0] == "名詞")
+    return {
+        "proper_noun_ratio": proper / total,
+        "noun_ratio": noun / total,
+        "lexical_diversity": len(set(surfaces)) / total,
+    }
 
 def extract_features(text):
-    exclamation  = text.count("!")
-    ambiguity    = sum(text.count(a) for a in ["かも", "思われる", "らしい", "のよう", "いわれている", "可能性", "だろう"])
-    symbol       = len(re.findall(r'[^\w぀-ヿ一-鿿\s]', text))
-    length       = len(text)
-    digit_r      = sum(c.isdigit() for c in text) / max(len(text), 1)
-    words        = list(tagger(str(text)))
-    total        = len(words)
-    proper       = sum(1 for w in words if len(w.feature) > 1 and w.feature[0] == "名詞" and w.feature[1] == "固有名詞")
-    proper_r     = proper / total if total > 0 else 0
-    sentences    = [s for s in re.split(r'[。！？]', text) if s]
-    avg_sent_len = sum(len(s) for s in sentences) / len(sentences) if sentences else 0
-    noun         = sum(1 for w in words if w.feature[0] == "名詞")
-    noun_r       = noun / max(total, 1)
-    sent_count   = len(sentences)
-    kanji_r      = len(re.findall(r'[一-龯]', text)) / max(len(text), 1)
-    hira_r       = len(re.findall(r'[ぁ-ん]', text)) / max(len(text), 1)
-    pos_w        = sum(text.count(w) for w in POSITIVE_WORDS)
-    neg_w        = sum(text.count(w) for w in NEGATIVE_WORDS)
-    sentiment    = (pos_w - neg_w) / max(pos_w + neg_w, 1) if (pos_w + neg_w) > 0 else 0.0
-    digit_c      = len(re.findall(r'[0-9０-９]', text))
-    kata_c       = len(re.findall(r'[ァ-ヶ]', text))
-    return [exclamation, ambiguity, symbol, length, digit_r, proper_r,
-            avg_sent_len, noun_r, sent_count, kanji_r, hira_r, sentiment, digit_c, kata_c]
+    """feature_columns の並び順で特徴量ベクトルを返す"""
+    base = {
+        "symbol_count":        symbol_count(text),
+        "text_length":         text_length(text),
+        "digit_ratio":         digit_ratio(text),
+        "avg_sentence_length": avg_sentence_length(text),
+        "sentence_count":      sentence_count(text),
+        "kanji_ratio":         kanji_ratio(text),
+        "hiragana_ratio":      hiragana_ratio(text),
+        "report_style_count":  report_style_count(text),
+        "quote_style_count":   quote_style_count(text),
+        "person_info_count":   person_info_count(text),
+        "comma_count":         comma_count(text),
+        "numeric_specificity": numeric_specificity(text),
+        "comma_per_sentence":  comma_per_sentence(text),
+    }
+    base.update(mecab_features(text))
+    return [base[col] for col in FEATURE_COLUMNS]
 
-# 各特徴量の言い回し（多いとき, 少ないとき）。extract_featuresの並び順と対応
-FEATURE_PHRASES = [
-    ("感嘆符（！）が多い", "感嘆符（！）が少ない"),
-    ("曖昧な表現が多い", "曖昧な表現が少ない"),
-    ("記号が多い", "記号が少ない"),
-    ("文章が長い", "文章が短い"),
-    ("数字の割合が高い", "数字の割合が低い"),
-    ("固有名詞が多い", "固有名詞が少ない"),
-    ("一文が長い", "一文が短い"),
-    ("名詞が多い", "名詞が少ない"),
-    ("文の数が多い", "文の数が少ない"),
-    ("漢字が多い", "漢字が少ない"),
-    ("ひらがなが多い", "ひらがなが少ない"),
-    ("肯定的な表現が多い", "否定的な表現が多い"),
-    ("数字が多い", "数字が少ない"),
-    ("カタカナが多い", "カタカナが少ない"),
-]
+# ──────────────────────────────────────────
+# 判定理由の言い回し（多いとき, 少ないとき）
+# ──────────────────────────────────────────
+FEATURE_PHRASES = {
+    "symbol_count":        ("記号が多い", "記号が少ない"),
+    "text_length":         ("文章が長い", "文章が短い"),
+    "digit_ratio":         ("数字の割合が高い", "数字の割合が低い"),
+    "avg_sentence_length": ("一文が長い", "一文が短い"),
+    "sentence_count":      ("文の数が多い", "文の数が少ない"),
+    "kanji_ratio":         ("漢字が多い", "漢字が少ない"),
+    "hiragana_ratio":      ("ひらがなが多い", "ひらがなが少ない"),
+    "report_style_count":  ("報道的な表現が多い", "報道的な表現が少ない"),
+    "quote_style_count":   ("引用・伝聞の表現が多い", "引用・伝聞の表現が少ない"),
+    "person_info_count":   ("人物の情報が多い", "人物の情報が少ない"),
+    "comma_count":         ("読点（、）が多い", "読点（、）が少ない"),
+    "numeric_specificity": ("具体的な数値が多い", "具体的な数値が少ない"),
+    "comma_per_sentence":  ("一文あたりの読点が多い", "一文あたりの読点が少ない"),
+    "proper_noun_ratio":   ("固有名詞が多い", "固有名詞が少ない"),
+    "noun_ratio":          ("名詞が多い", "名詞が少ない"),
+    "lexical_diversity":   ("語彙が多様", "語彙が単調"),
+}
 
-def make_reasons(features):
-    """記事の各特徴量が平均より多い/少ないかで理由を生成"""
-    real_mean = real_stats["real_mean"]
-    fake_mean = real_stats["fake_mean"]
-    values = features[0]
-
+def make_reasons(feature_values):
+    """各特徴量が平均より多い/少ないかで理由を生成"""
+    real_mean = feature_stats["real_mean"]
+    fake_mean = feature_stats["fake_mean"]
     reasons = []
-    for (high_phrase, low_phrase), val, r_m, f_m in zip(FEATURE_PHRASES, values, real_mean, fake_mean):
-        # リアルとフェイクの中間を「平均的」の基準にする
+    for col, val, r_m, f_m in zip(FEATURE_COLUMNS, feature_values, real_mean, fake_mean):
         mid = (r_m + f_m) / 2
         gap = f_m - r_m
         if abs(gap) < 1e-9:
-            continue  # リアルとフェイクで差がない特徴量は判断材料にしない
-        # 基準からどれだけ離れているか（リアル〜フェイクの差を1とした大きさ）
+            continue
         strength = abs(val - mid) / abs(gap)
         if strength < 0.25:
-            continue  # 平均的な範囲は理由にしない
-        phrase = high_phrase if val > mid else low_phrase
-        reasons.append((strength, phrase))
-
-    # 根拠の強い順に並べる
+            continue
+        high_phrase, low_phrase = FEATURE_PHRASES[col]
+        reasons.append((strength, high_phrase if val > mid else low_phrase))
     reasons.sort(reverse=True)
     return [r[1] for r in reasons]
 
+# ──────────────────────────────────────────
+# TextCNN モデル定義（学習時と同じ構造）
+# ──────────────────────────────────────────
+class TextCNN(nn.Module):
+    def __init__(self, vocab_size, extra_dim, num_classes=2, embed_dim=128, num_filters=128):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.conv3 = nn.Conv1d(embed_dim, num_filters, 3)
+        self.conv4 = nn.Conv1d(embed_dim, num_filters, 4)
+        self.conv5 = nn.Conv1d(embed_dim, num_filters, 5)
+        self.dropout = nn.Dropout(0.5)
+        self.fc1 = nn.Linear(num_filters * 3 + extra_dim, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+
+    def forward(self, x, extra):
+        x  = self.embedding(x)
+        x  = x.transpose(1, 2)
+        c3 = torch.max(F.relu(self.conv3(x)), dim=2)[0]
+        c4 = torch.max(F.relu(self.conv4(x)), dim=2)[0]
+        c5 = torch.max(F.relu(self.conv5(x)), dim=2)[0]
+        x  = torch.cat([c3, c4, c5], dim=1)
+        x  = self.dropout(x)
+        x  = torch.cat([x, extra], dim=1)
+        x  = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+# モデルの読み込み（CPUで動かす）
+@st.cache_resource
+def load_model():
+    m = TextCNN(
+        vocab_size=config["vocab_size"],
+        extra_dim=config["extra_dim"],
+        num_classes=config["num_classes"],
+    )
+    state = torch.load(os.path.join(ART, "cnn_model.pt"), map_location="cpu")
+    m.load_state_dict(state)
+    m.eval()
+    return m
+
+model = load_model()
+
+# ──────────────────────────────────────────
+# 予測
+# ──────────────────────────────────────────
 def predict_reliability(text):
-    # 改行・スペース・タブをすべて除去
     text = re.sub(r'\s+', '', text)
 
-    # TF-IDF
-    x_tfidf = vectorizer.transform([tokenize_text(text)])
+    # テキストをID化
+    ids = torch.tensor([encode(text)], dtype=torch.long)
 
-    # 独自特徴量
-    features = np.array(extract_features(text)).reshape(1, -1)
-    features_scaled = scaler.transform(features)
+    # 独自特徴量を標準化
+    feats = extract_features(text)
+    feats_scaled = scaler.transform(np.array(feats).reshape(1, -1)).astype(np.float32)
+    extra = torch.tensor(feats_scaled, dtype=torch.float32)
 
-    # 結合
-    x = hstack((x_tfidf, features_scaled))
+    with torch.no_grad():
+        output = model(ids, extra)
+        prob = F.softmax(output, dim=1)[0].numpy()
 
-    # 予測
-    proba = model.predict_proba(x)[0]
-    fake_score = proba[1] + proba[2]
-    reliability = round((1 - fake_score) * 100, 1)
-
-    reasons = make_reasons(features)
+    real_prob = prob[0]                      # クラス0 = Real
+    reliability = round(real_prob * 100, 1)  # 信頼度 = リアルである確率
+    reasons = make_reasons(feats)
     return reliability, reasons
 
+# ──────────────────────────────────────────
+# 画面
+# ──────────────────────────────────────────
 st.title("ニュース信頼度判定")
-text = st.text_area("ニュース本文を貼り付けてください")
+text = st.text_area("ニュース本文を貼り付けてください", height=250)
 
 if st.button("判定する"):
     if not text.strip():

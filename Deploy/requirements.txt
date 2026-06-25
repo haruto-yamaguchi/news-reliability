@@ -1,4 +1,5 @@
 streamlit
+torch
 scikit-learn
 scipy
 numpy
